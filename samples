@@ -1,0 +1,12 @@
+source /workspace/miniconda3/bin/activate comfyui
+
+modelscope download --model Kijai/WanVideo_comfy umt5-xxl-enc-bf16.safetensors --local_dir ./
+modelscope download --model Kijai/WanVideo_comfy Wan2_1_VAE_bf16.safetensors --local_dir ./
+modelscope download --model AI-ModelScope/Wan2.1_T2V_1.3B_SelfForcing_VACE Wan2.1_T2V_1.3B_SelfForcing_DMD-FP8_e4m3fn.safetensors --local_dir ./
+
+python main.py --enable-manager --use-sage-attention
+
+
+python main.py --listen --use-sage-attention --port 8188
+
+uvicorn demo_comfyui_fastapi_wan21_1__3B:app --host 0.0.0.0 --port 9002 --reload --log-level debug
