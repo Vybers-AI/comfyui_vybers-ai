@@ -15,6 +15,8 @@ python demo_api.py
 ```
 
 # For develop workflow, enable Manager
+```
 python main.py --enable-manager --use-sage-attention
+```
 
 
