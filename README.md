@@ -1,6 +1,6 @@
 # Quick Start
 
-'''
+```
 # activate env
 source /workspace/miniconda3/bin/activate comfyui
 # Terminal 1, run comfyui main process
@@ -12,7 +12,7 @@ uvicorn demo_comfyui_fastapi_wan21_1__3B:app --host 0.0.0.0 --port 9003 --reload
 
 # api demo
 python demo_api.py
-'''
+```
 
 # For develop workflow, enable Manager
 python main.py --enable-manager --use-sage-attention
