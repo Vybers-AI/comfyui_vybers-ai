@@ -331,11 +331,10 @@ def _iter_file_range(path: Path, start: int, end: int, chunk_size: int = 1024 * 
             yield chunk
 
 @app.get("/jobs/{job_id}/download")
-def download_job_video(job_id: str, request: Request, x_api_key: str = Header(None)):
+def download_job_video(job_id: str, request: Request):
     """
     Stream the MP4. Supports HTTP Range for browser playback/seeking.
     """
-    _auth(x_api_key)
 
     rec = _ensure_job_record(job_id)
     if rec.get("status") != "succeeded" or not rec.get("served_path"):
