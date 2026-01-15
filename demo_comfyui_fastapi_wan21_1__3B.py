@@ -1,258 +1,456 @@
-from fastapi import FastAPI, HTTPException, Header
-from pydantic import BaseModel
-import requests
+import asyncio
 import copy
 import json
-import os
-import urllib.parse
-import time
 import logging
-from typing import List, Optional
+import os
 import shutil
+import time
+import urllib.parse
+from pathlib import Path
+from typing import Dict, Optional, Tuple
 
-# ---------------- 配置 ----------------
-API_KEY = "12345"
-COMFYUI_API_URL = "http://0.0.0.0:8188"  # ComfyUI API 地址
-WORKFLOW_FILE = "/workspace/fdy/comfyui_vybers-ai/wan2.1-t2v-1_3B_api.json"  # 工作流文件
-POLL_INTERVAL = 2  # 轮询间隔（秒）
-MAX_WAIT_TIME = 300  # 最大等待时间（秒）
-STATIC_DIR = "videos"  # 视频存储目录
-SERVER_BASE_URL = "http://server_ip:9003"  # 对外访问地址
+import requests
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
-# 日志配置
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# ---------------- Config (env-first) ----------------
+API_KEY = os.getenv("VYBERS_API_KEY", "12345")
 
-# 创建存储目录
-os.makedirs(STATIC_DIR, exist_ok=True)
+COMFYUI_API_URL = os.getenv("COMFYUI_API_URL", "http://0.0.0.0:8188")
+WORKFLOW_FILE = os.getenv(
+    "WORKFLOW_FILE",
+    "/workspace/fdy/comfyui_vybers-ai/wan2.1-t2v-1_3B_api.json",
+)
 
-# ---------------- 读取工作流 ----------------
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "2"))
+MAX_WAIT_TIME = int(os.getenv("MAX_WAIT_TIME", "300"))
+
+STATIC_DIR = os.getenv("STATIC_DIR", "videos")  # served output dir
+STATIC_DIR_PATH = Path(STATIC_DIR)
+STATIC_DIR_PATH.mkdir(parents=True, exist_ok=True)
+
+# Optional: if you know your public base URL, set it (e.g. https://gpu-api.vybers.ai)
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+
+# TTL cleanup (optional)
+JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS", str(24 * 3600)))  # 24h default
+ENABLE_CLEANUP = os.getenv("ENABLE_CLEANUP", "1") == "1"
+
+# ---------------- Logging ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("vybers_comfy_api")
+
+# ---------------- Load workflow ----------------
 try:
     with open(WORKFLOW_FILE, "r", encoding="utf-8") as f:
         base_workflow = json.load(f)
-    logger.info(f"成功加载工作流文件: {WORKFLOW_FILE}")
-except FileNotFoundError:
-    logger.error(f"工作流文件不存在: {WORKFLOW_FILE}")
-    raise
-except json.JSONDecodeError as e:
-    logger.error(f"工作流文件JSON解析错误: {e}")
+    logger.info(f"Loaded workflow: {WORKFLOW_FILE}")
+except Exception as e:
+    logger.error(f"Failed to load workflow {WORKFLOW_FILE}: {e}")
     raise
 
-# ---------------- 请求体定义 ----------------
+# ---------------- Request models ----------------
 class GenerateVideoRequest(BaseModel):
     positive: str
     negative: str = ""
     height: int = 512
     width: int = 512
-    length: int = 81  # 视频帧数
+    length: int = 81  # num frames
     fps: int = 16
 
-# ---------------- FastAPI 实例 ----------------
-app = FastAPI(title="ComfyUI Video Generation API")
+# ---------------- App ----------------
+app = FastAPI(title="Vybers ComfyUI Video Generation API")
 
-# ---------------- 辅助函数 ----------------
-def wait_for_prompt_completion(prompt_id: str, max_wait: int = MAX_WAIT_TIME) -> dict:
-    """
-    等待 ComfyUI 任务完成
-    """
-    start_time = time.time()
-    while time.time() - start_time < max_wait:
-        try:
-            history_resp = requests.get(f"{COMFYUI_API_URL}/history/{prompt_id}")
-            history_resp.raise_for_status()
-            history = history_resp.json()
-            
-            if prompt_id in history:
-                status = history[prompt_id].get("status", {})
-                if status.get("status_str") == "success":
-                    logger.info(f"任务 {prompt_id} 已完成")
-                    return history[prompt_id]
-                elif status.get("status_str") == "error":
-                    logger.error(f"任务 {prompt_id} 执行失败: {status}")
-                    raise HTTPException(status_code=500, detail=f"ComfyUI task failed: {status}")
-            
-            time.sleep(POLL_INTERVAL)
-        except requests.RequestException as e:
-            logger.error(f"查询任务状态时出错: {e}")
-            raise HTTPException(status_code=500, detail=f"Error checking task status: {e}")
-    
-    logger.error(f"任务 {prompt_id} 超时未完成")
-    raise HTTPException(status_code=504, detail="Task timeout")
+# If your webapp calls GPU API directly from browser, you need CORS.
+# If you proxy through Next.js, you can disable/lock this down.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def download_file_from_comfyui(file_info: dict) -> str:
-    """
-    从 ComfyUI 下载文件并保存到本地
-    """
-    try:
-        filename = file_info["filename"]
-        subfolder = file_info.get("subfolder", "")
-        filetype = file_info.get("type", "output")
-        
-        # 构建下载URL
-        file_url = f"{COMFYUI_API_URL}/view?filename={urllib.parse.quote(filename)}"
-        if subfolder:
-            file_url += f"&subfolder={urllib.parse.quote(subfolder)}"
-        if filetype:
-            file_url += f"&type={urllib.parse.quote(filetype)}"
-        
-        logger.info(f"下载文件: {filename} (子文件夹: {subfolder})")
-        
-        # 下载文件
-        file_resp = requests.get(file_url)
-        file_resp.raise_for_status()
-        
-        # 确保子目录存在
-        save_dir = os.path.join(STATIC_DIR, subfolder) if subfolder else STATIC_DIR
-        os.makedirs(save_dir, exist_ok=True)
-        
-        # 保存文件
-        save_path = os.path.join(save_dir, filename)
-        with open(save_path, "wb") as f:
-            f.write(file_resp.content)
-        
-        file_size = len(file_resp.content) / 1024 / 1024
-        logger.info(f"文件已保存: {save_path} (大小: {file_size:.2f} MB)")
-        
-        # 生成对外访问URL
-        public_url = f"{SERVER_BASE_URL}/static/{subfolder}/{filename}" if subfolder else f"{SERVER_BASE_URL}/static/{filename}"
-        return public_url
-        
-    except Exception as e:
-        logger.error(f"文件下载失败: {e}")
-        raise HTTPException(status_code=500, detail=f"File download failed: {e}")
+# ---------------- In-memory job store ----------------
+# For single instance this is fine. If you need persistence/restarts, swap for sqlite/redis.
+Jobs = Dict[str, dict]
+jobs: Jobs = {}  # job_id == prompt_id
 
-# ---------------- 生成接口 ----------------
-@app.post("/generate_video", response_model=dict)
-def generate_video(req: GenerateVideoRequest, x_api_key: str = Header(None)):
-    """
-    生成视频的API端点
-    """
-    # API密钥验证
+def _auth(x_api_key: Optional[str]):
     if x_api_key != API_KEY:
-        logger.warning(f"无效的API密钥: {x_api_key}")
         raise HTTPException(status_code=401, detail="Invalid API Key")
-    
-    logger.info(f"收到视频生成请求: {req.positive[:50]}...")
-    
-    # 深拷贝工作流
+
+def _public_base(request: Request) -> str:
+    # Prefer env var for correctness behind proxies.
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    # Fallback: derive from incoming request.
+    return str(request.base_url).rstrip("/")
+
+def _now() -> float:
+    return time.time()
+
+def _safe_copy(src: str, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(src, str(dst))
+
+def _extract_first_media_file(outputs: dict) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Try to find an output file path from ComfyUI history outputs.
+
+    Returns: (fullpath, filename)
+    """
+    if not outputs:
+        return None, None
+
+    # Common keys seen in ComfyUI/VHS outputs: gifs, videos, video, images
+    candidate_keys = ["gifs", "videos", "video", "images"]
+
+    for _, out in outputs.items():
+        for key in candidate_keys:
+            if key in out and out[key]:
+                item = out[key][0]
+                # Most robust: fullpath if present
+                fullpath = item.get("fullpath")
+                filename = item.get("filename")
+                if fullpath and os.path.exists(fullpath):
+                    return fullpath, filename or os.path.basename(fullpath)
+
+    return None, None
+
+def _download_from_comfyui_view(file_info: dict, save_as: Path) -> None:
+    """
+    Fallback if ComfyUI doesn't provide fullpath.
+    Uses /view?filename=...&subfolder=...&type=...
+    """
+    filename = file_info["filename"]
+    subfolder = file_info.get("subfolder", "")
+    filetype = file_info.get("type", "output")
+
+    file_url = f"{COMFYUI_API_URL}/view?filename={urllib.parse.quote(filename)}"
+    if subfolder:
+        file_url += f"&subfolder={urllib.parse.quote(subfolder)}"
+    if filetype:
+        file_url += f"&type={urllib.parse.quote(filetype)}"
+
+    resp = requests.get(file_url, timeout=60)
+    resp.raise_for_status()
+    save_as.parent.mkdir(parents=True, exist_ok=True)
+    save_as.write_bytes(resp.content)
+
+def _submit_prompt(req: GenerateVideoRequest) -> str:
     workflow = copy.deepcopy(base_workflow)
-    
-    # 修改工作流参数
+
+    # Update workflow nodes (your existing mapping)
     workflow["16"]["inputs"]["positive_prompt"] = req.positive
-    workflow["16"]["inputs"]["negative_prompt"] = req.negative 
+    workflow["16"]["inputs"]["negative_prompt"] = req.negative
     workflow["37"]["inputs"]["width"] = req.width
     workflow["37"]["inputs"]["height"] = req.height
     workflow["37"]["inputs"]["num_frames"] = req.length
     workflow["58"]["inputs"]["frame_rate"] = req.fps
-    
-    logger.info(f"工作流配置 - 尺寸: {req.width}x{req.height}, 帧数: {req.length}, FPS: {req.fps}")
-    
-    # 提交任务到ComfyUI
-    try:
-        prompt_resp = requests.post(
-            f"{COMFYUI_API_URL}/prompt",
-            json={"prompt": workflow}
-        )
-        prompt_resp.raise_for_status()
-        prompt_id = prompt_resp.json()["prompt_id"]
-        logger.info(f"任务已提交，Prompt ID: {prompt_id}")
-    except requests.RequestException as e:
-        logger.error(f"提交任务失败: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to submit task: {e}")
-    
-    # 等待任务完成
-    task_result = wait_for_prompt_completion(prompt_id)
-    
-    # 提取输出文件
-    outputs = task_result.get("outputs", {})
-    if not outputs:
-        logger.error("任务完成但未找到输出")
-        raise HTTPException(status_code=500, detail="No outputs found")
-    
-    # 下载所有输出文件（视频和图片）
-    public_urls = []
-    for node_id, output_data in outputs.items():
-        # # 检查图片输出
-        # if "images" in output_data:
-        #     for file_info in output_data["images"]:
-        #         try:
-        #             url = download_file_from_comfyui(file_info)
-        #             public_urls.append({
-        #                 "node_id": node_id,
-        #                 "type": "image",
-        #                 "url": url,
-        #                 "filename": file_info["filename"]
-        #             })
-        #         except Exception as e:
-        #             logger.warning(f"下载图片失败 (节点 {node_id}): {e}")
-        
-        # # 检查视频输出
-        # if "video" in output_data:
-        #     for file_info in output_data["video"]:
-        #         try:
-        #             url = download_file_from_comfyui(file_info)
-        #             public_urls.append({
-        #                 "node_id": node_id,
-        #                 "type": "video",
-        #                 "url": url,
-        #                 "filename": file_info["filename"]
-        #             })
-        #         except Exception as e:
-        #             logger.warning(f"下载视频失败 (节点 {node_id}): {e}")
 
-        # 已保存视频，直接复制过来
-        comfyui_save_video_path = output_data['gifs'][0]['fullpath']
-        save_video_path = os.path.join(STATIC_DIR, output_data['gifs'][0]['filename'])
-        shutil.copy(comfyui_save_video_path, os.path.join(STATIC_DIR, output_data['gifs'][0]['filename']))
-        public_urls.append(
-            {
-                "node_id": node_id,
-                "type": "video",
-                "url": f"{SERVER_BASE_URL}/static/{output_data['gifs'][0]['filename']}",
-                "filename": save_video_path
-            }
-        )
-    
-    if not public_urls:
-        logger.error("未找到任何可下载的文件")
-        raise HTTPException(status_code=500, detail="No downloadable files found")
-    
-    logger.info(f"任务完成，生成 {len(public_urls)} 个文件")
+    prompt_resp = requests.post(f"{COMFYUI_API_URL}/prompt", json={"prompt": workflow}, timeout=30)
+    prompt_resp.raise_for_status()
+    return prompt_resp.json()["prompt_id"]
+
+def _fetch_history(job_id: str) -> dict:
+    resp = requests.get(f"{COMFYUI_API_URL}/history/{job_id}", timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+def _ensure_job_record(job_id: str) -> dict:
+    if job_id not in jobs:
+        jobs[job_id] = {
+            "job_id": job_id,
+            "created_at": _now(),
+            "status": "queued",   # queued|running|succeeded|failed|expired
+            "error": None,
+            "served_path": None,
+            "completed_at": None,
+        }
+    return jobs[job_id]
+
+def _finalize_success(job_id: str, history_item: dict) -> dict:
+    outputs = history_item.get("outputs", {})
+    fullpath, filename = _extract_first_media_file(outputs)
+
+    served_path = STATIC_DIR_PATH / f"{job_id}.mp4"
+
+    if fullpath:
+        _safe_copy(fullpath, served_path)
+    else:
+        # Try derive file_info from outputs for /view fallback
+        file_info = None
+        for _, out in outputs.items():
+            for k in ("gifs", "videos", "video", "images"):
+                if k in out and out[k]:
+                    file_info = out[k][0]
+                    break
+            if file_info:
+                break
+        if not file_info:
+            raise HTTPException(status_code=500, detail="No output file info found")
+        _download_from_comfyui_view(file_info, served_path)
+
+    rec = _ensure_job_record(job_id)
+    rec["status"] = "succeeded"
+    rec["served_path"] = str(served_path)
+    rec["completed_at"] = _now()
+    return rec
+
+def _status_from_history(job_id: str) -> dict:
+    rec = _ensure_job_record(job_id)
+
+    # If file exists already, return succeeded quickly
+    if rec.get("status") == "succeeded" and rec.get("served_path"):
+        if Path(rec["served_path"]).exists():
+            return rec
+        # file missing => expired or cleaned
+        rec["status"] = "expired"
+        rec["served_path"] = None
+        return rec
+
+    history = _fetch_history(job_id)
+
+    if job_id not in history:
+        # ComfyUI might not have it ready in history yet
+        rec["status"] = "running"
+        return rec
+
+    item = history[job_id]
+    status_obj = item.get("status", {})
+    status_str = status_obj.get("status_str")
+
+    if status_str == "error":
+        rec["status"] = "failed"
+        rec["error"] = status_obj
+        return rec
+
+    if status_str != "success":
+        rec["status"] = "running"
+        return rec
+
+    # success -> ensure we have a served file
+    try:
+        return _finalize_success(job_id, item)
+    except Exception as e:
+        rec["status"] = "failed"
+        rec["error"] = str(e)
+        return rec
+
+async def _cleanup_loop():
+    while True:
+        try:
+            if ENABLE_CLEANUP and JOB_TTL_SECONDS > 0:
+                cutoff = _now() - JOB_TTL_SECONDS
+                # clean job records + files
+                for job_id, rec in list(jobs.items()):
+                    created_at = rec.get("created_at", 0)
+                    if created_at and created_at < cutoff:
+                        sp = rec.get("served_path")
+                        if sp and Path(sp).exists():
+                            try:
+                                Path(sp).unlink()
+                            except Exception:
+                                pass
+                        rec["status"] = "expired"
+                        rec["served_path"] = None
+        except Exception as e:
+            logger.warning(f"cleanup_loop error: {e}")
+
+        await asyncio.sleep(60)
+
+@app.on_event("startup")
+async def startup_event():
+    if ENABLE_CLEANUP:
+        asyncio.create_task(_cleanup_loop())
+
+# ---------------- New API: jobs ----------------
+
+@app.post("/jobs", response_model=dict)
+def create_job(req: GenerateVideoRequest, request: Request, x_api_key: str = Header(None)):
+    """
+    Create an async job. Returns job_id immediately.
+    """
+    _auth(x_api_key)
+
+    try:
+        job_id = _submit_prompt(req)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to submit task: {e}")
+
+    rec = _ensure_job_record(job_id)
+    rec["status"] = "queued"
+    rec["created_at"] = _now()
+
     return {
-        "prompt_id": prompt_id,
-        "status": "success",
-        "files": public_urls
+        "job_id": job_id,
+        "status": rec["status"],
+        "status_url": f"{_public_base(request)}/jobs/{job_id}",
+        "download_url": None,
     }
 
-# ---------------- 静态文件服务 ----------------
-from fastapi.staticfiles import StaticFiles
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+@app.get("/jobs/{job_id}", response_model=dict)
+def get_job(job_id: str, request: Request, x_api_key: str = Header(None)):
+    """
+    Poll job status. When succeeded, provides download_url.
+    """
+    _auth(x_api_key)
 
-# ---------------- 健康检查 ----------------
+    try:
+        rec = _status_from_history(job_id)
+    except requests.RequestException as e:
+        raise HTTPException(status_code=503, detail=f"ComfyUI not reachable: {e}")
+
+    download_url = None
+    if rec["status"] == "succeeded":
+        download_url = f"{_public_base(request)}/jobs/{job_id}/download"
+
+    return {
+        "job_id": job_id,
+        "status": rec["status"],
+        "created_at": rec.get("created_at"),
+        "completed_at": rec.get("completed_at"),
+        "error": rec.get("error"),
+        "download_url": download_url,
+    }
+
+# ---------------- Download with Range support ----------------
+
+def _iter_file_range(path: Path, start: int, end: int, chunk_size: int = 1024 * 1024):
+    with path.open("rb") as f:
+        f.seek(start)
+        remaining = end - start + 1
+        while remaining > 0:
+            chunk = f.read(min(chunk_size, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+
+@app.get("/jobs/{job_id}/download")
+def download_job_video(job_id: str, request: Request, x_api_key: str = Header(None)):
+    """
+    Stream the MP4. Supports HTTP Range for browser playback/seeking.
+    """
+    _auth(x_api_key)
+
+    rec = _ensure_job_record(job_id)
+    if rec.get("status") != "succeeded" or not rec.get("served_path"):
+        # Attempt to refresh status (in case user goes straight to download)
+        rec = _status_from_history(job_id)
+        if rec.get("status") != "succeeded" or not rec.get("served_path"):
+            raise HTTPException(status_code=404, detail="Video not ready")
+
+    path = Path(rec["served_path"])
+    if not path.exists():
+        rec["status"] = "expired"
+        rec["served_path"] = None
+        raise HTTPException(status_code=404, detail="Video expired or missing")
+
+    file_size = path.stat().st_size
+    range_header = request.headers.get("range")
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": "video/mp4",
+        "Content-Disposition": f'inline; filename="{path.name}"',
+    }
+
+    if not range_header:
+        return StreamingResponse(path.open("rb"), headers=headers)
+
+    # Parse: Range: bytes=start-end
+    try:
+        _, rng = range_header.split("=")
+        start_s, end_s = rng.split("-")
+        start = int(start_s) if start_s else 0
+        end = int(end_s) if end_s else file_size - 1
+        end = min(end, file_size - 1)
+        if start > end:
+            raise ValueError("invalid range")
+    except Exception:
+        raise HTTPException(status_code=416, detail="Invalid Range header")
+
+    headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+    return StreamingResponse(
+        _iter_file_range(path, start, end),
+        status_code=206,
+        headers=headers,
+    )
+
+# ---------------- Backward compatible endpoint ----------------
+
+@app.post("/generate_video", response_model=dict)
+def generate_video(req: GenerateVideoRequest, request: Request, x_api_key: str = Header(None), wait: int = 1):
+    """
+    Backward compatible: by default waits for completion (wait=1).
+    For webapp async flow, call POST /jobs and poll GET /jobs/{id}.
+    """
+    _auth(x_api_key)
+
+    # create job
+    create = create_job(req, request, x_api_key)
+
+    if not wait:
+        return {
+            "prompt_id": create["job_id"],
+            "status": create["status"],
+            "files": [],
+            "status_url": create["status_url"],
+        }
+
+    # wait (old behavior)
+    job_id = create["job_id"]
+    start = _now()
+    while _now() - start < MAX_WAIT_TIME:
+        rec = _status_from_history(job_id)
+        if rec["status"] == "succeeded":
+            return {
+                "prompt_id": job_id,
+                "status": "success",
+                "files": [
+                    {
+                        "node_id": "unknown",
+                        "type": "video",
+                        "url": f"{_public_base(request)}/jobs/{job_id}/download",
+                        "filename": rec["served_path"],
+                    }
+                ],
+            }
+        if rec["status"] == "failed":
+            raise HTTPException(status_code=500, detail=f"ComfyUI task failed: {rec.get('error')}")
+        time.sleep(POLL_INTERVAL)
+
+    raise HTTPException(status_code=504, detail="Task timeout")
+
+# ---------------- Health ----------------
+
 @app.get("/health")
 def health_check():
-    """
-    健康检查端点
-    """
     try:
-        # 检查ComfyUI是否可访问
         resp = requests.get(f"{COMFYUI_API_URL}/system_stats", timeout=5)
         resp.raise_for_status()
         return {
             "status": "healthy",
             "comfyui_status": "connected",
             "static_dir": STATIC_DIR,
-            "server_url": SERVER_BASE_URL
+            "public_base_url": PUBLIC_BASE_URL or None,
         }
     except Exception as e:
-        logger.error(f"健康检查失败: {e}")
-        raise HTTPException(status_code=503, detail="ComfyUI not available")
+        raise HTTPException(status_code=503, detail=f"ComfyUI not available: {e}")
 
-# ---------------- 启动信息 ----------------
+# ---------------- Optional: keep static hosting too ----------------
+# You can keep this, but the /jobs/{id}/download endpoint is the one browsers like best.
+from fastapi.staticfiles import StaticFiles
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
 if __name__ == "__main__":
     import uvicorn
-    logger.info(f"启动API服务器，监听端口 9001")
-    logger.info(f"ComfyUI地址: {COMFYUI_API_URL}")
-    logger.info(f"工作流文件: {WORKFLOW_FILE}")
-    logger.info(f"视频存储目录: {STATIC_DIR}")
-    uvicorn.run(app, host="0.0.0.0", port=9003)
+    port = int(os.getenv("PORT", "9003"))
+    logger.info(f"Starting API server on 0.0.0.0:{port}")
+    logger.info(f"ComfyUI: {COMFYUI_API_URL}")
+    logger.info(f"Workflow: {WORKFLOW_FILE}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
